@@ -1,0 +1,9 @@
+defaults:
+  - policy: "bc"
+
+eval:
+  env_id: "hopper-perturbed-v0"
+  dataset_id: "hopper-medium-v2"
+  max_episode_steps: 1000
+  num_episodes: 10
+  seed: 0
