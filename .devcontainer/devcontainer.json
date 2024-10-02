@@ -1,0 +1,21 @@
+{
+    "name": "xai606",
+    "build": {
+        "dockerfile": "dev.Dockerfile",
+        "context": ".."
+    },
+    "runArgs": ["--shm-size", "1gb", "--gpus", "all"],
+    "containerEnv": {
+        "D4RL_SUPPRESS_IMPORT_ERROR": "1"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "charliermarsh.ruff",
+                "ms-toolsai.jupyter"
+            ]
+        }
+    }
+}
