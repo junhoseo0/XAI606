@@ -13,6 +13,8 @@ dependencies = [
     "jax[cuda12]>=0.4.33",
     "mjrl",
     "numpy<2",
+    "optax>=0.2.3",
+    "orbax>=0.1.9",
     "patchelf>=0.17.2.1",
 ]
 
