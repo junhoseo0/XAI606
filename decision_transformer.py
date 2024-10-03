@@ -27,16 +27,16 @@ class CausalAttentionBlock(nnx.Module):
         )
 
     def __call__(self, x):
-        T, C = x.shape
+        B, T, C = x.shape
 
-        causal_mask = nnx.make_causal_mask(jnp.zeros((T,)))
+        causal_mask = nnx.make_causal_mask(jnp.zeros((B, T)))
 
         att = self.ln_1(x)
-        q, k, v = jnp.split(self.kqv(att), 3, axis=1)
-        k = k.reshape(T, self.num_heads, C // self.num_heads)
-        q = q.reshape(T, self.num_heads, C // self.num_heads)
-        v = v.reshape(T, self.num_heads, C // self.num_heads)
-        att = nnx.dot_product_attention(q, k, v, mask=causal_mask).reshape(T, C)
+        q, k, v = jnp.split(self.kqv(att), 3, axis=2)
+        k = k.reshape(B, T, self.num_heads, C // self.num_heads)
+        q = q.reshape(B, T, self.num_heads, C // self.num_heads)
+        v = v.reshape(B, T, self.num_heads, C // self.num_heads)
+        att = nnx.dot_product_attention(q, k, v, mask=causal_mask).reshape(B, T, C)
         x = x + att
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -77,7 +77,7 @@ class DecisionGPT(nnx.Module):
         )
 
     def __call__(self, obss, actions, return_to_gos, timesteps):
-        T = obss.shape[0]
+        B, T = obss.shape[:2]
 
         obs_embeddings = self.embed_obs(obss)
         act_embeddings = self.embed_act(actions)
@@ -89,36 +89,32 @@ class DecisionGPT(nnx.Module):
         return_embeddings += timestep_embeddings
 
         seqs = jnp.stack([return_embeddings, obs_embeddings, act_embeddings], axis=1)
-        seqs = jnp.permute_dims(seqs, (1, 0, 2)).reshape(3 * T, self.emb_dim)
+        seqs = jnp.permute_dims(seqs, (0, 2, 1, 3)).reshape(B, 3 * T, self.emb_dim)
 
         x = self.transformer(seqs)
         x = self.ln(x)
 
-        x = x.reshape(T, 3, self.emb_dim)
-        x = jnp.permute_dims(x, (1, 0, 2))
-        return self.action_head(x[1])
+        x = x.reshape(B, T, 3, self.emb_dim)
+        x = jnp.permute_dims(x, (0, 2, 1, 3))
+        return self.action_head(x[:, 1])
 
 
-@nnx.vmap
-def loss_fn(model: DecisionGPT, states, actions, return_to_gos, timesteps):
-    pred_actions = model(states, actions, return_to_gos, timesteps)
-    loss = ((pred_actions - actions) ** 2).mean()
+def loss_fn(model: DecisionGPT, batch):
+    pred_actions = model(
+        batch["observations"],
+        batch["actions"],
+        batch["return_to_gos"],
+        batch["timesteps"],
+    )
+    loss = ((pred_actions - batch["actions"]) ** 2).mean()
     return loss
 
 
 @nnx.jit
 def train_step(
-    model: DecisionGPT,
-    optimizer: nnx.Optimizer,
-    metrics: nnx.MultiMetric,
-    states,
-    actions,
-    return_to_gos,
-    timesteps,
+    model: DecisionGPT, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch
 ):
-    loss, grads = nnx.value_and_grad(loss_fn)(
-        model, states, actions, return_to_gos, timesteps
-    )
+    loss, grads = nnx.value_and_grad(loss_fn)(model, batch)
     metrics.update(values=loss)
     optimizer.update(grads)
 
@@ -150,20 +146,23 @@ def rollout(
         for t in range(eval_steps):
             actions.append(jnp.zeros(env.action_space.shape[0]))
 
-            states_input = jnp.asarray(states[-context_len:])
-            actions_input = jnp.asarray(actions[-context_len:])
-            return_to_gos_input = jnp.asarray(return_to_gos[-context_len:])[..., None]
-            timesteps_input = jnp.asarray(timesteps[-context_len:])
+            states_input = jnp.asarray(states[-context_len:])[None]
+            actions_input = jnp.asarray(actions[-context_len:])[None]
+            return_to_gos_input = jnp.asarray(return_to_gos[-context_len:])[..., None][
+                None
+            ]
+            timesteps_input = jnp.asarray(timesteps[-context_len:])[None]
 
             # It will cause recompilation on first <context_len> steps.
-            action = get_action(
-                model,
-                states_input,
-                actions_input,
-                return_to_gos_input,
-                timesteps_input,
-            )
-            action = action[-1]
+            with jax.log_compiles():
+                action = get_action(
+                    model,
+                    states_input,
+                    actions_input,
+                    return_to_gos_input,
+                    timesteps_input,
+                )
+            action = action[0, -1]
             actions[-1] = action
 
             state, reward, done, _ = env.step(action)
@@ -206,7 +205,7 @@ def main():
     metrics = nnx.metrics.Average()
     optimizer = nnx.Optimizer(model, optax.adam(3e-4))
 
-    batch_size = 16
+    batch_size = 64
     context_len = 20
     key = jax.random.PRNGKey(0)
     for step in range(100_000):
@@ -218,21 +217,15 @@ def main():
         key, sample_key = jax.random.split(key)
         T = jax.random.randint(sample_key, (batch_size,), context_len, 1000)
         batch = {
-            k: v[t - context_len : t]
-            for k, v, t in zip(batch.keys(), batch.values(), T)
+            k: jnp.stack([v[i, t - context_len : t] for i, t in enumerate(T)])
+            for k, v in batch.items()
         }
-
-        train_step(
-            model,
-            optimizer,
-            metrics,
-            batch["observations"],
-            batch["actions"],
-            batch["rewards"].cumsum(axis=-1)[:, ::-1, None],
-            jnp.tile(
-                jnp.arange(start=0, stop=batch["rewards"].shape[1]), (batch_size, 1)
-            ),
+        batch["return_to_gos"] = batch["rewards"].cumsum(axis=-1)[:, ::-1, None]
+        batch["timesteps"] = jnp.tile(
+            jnp.arange(start=0, stop=batch["rewards"].shape[1]), (batch_size, 1)
         )
+
+        train_step(model, optimizer, metrics, batch)
 
         if step > 0 and step % 1_000 == 0:
             loss = metrics.compute()
@@ -245,7 +238,7 @@ def main():
             )
 
             model.eval()
-            perturbations = np.linspace(0.0, 100.0, 5)
+            perturbations = [180, 150, 130, 100, 80, 50, 0]
             for perturbations in perturbations:
                 cumulative_rewards = rollout(
                     env,
