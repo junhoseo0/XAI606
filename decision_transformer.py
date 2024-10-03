@@ -221,7 +221,11 @@ def main():
 
         if step > 0 and step % 10_000 == 0:
             model.eval()
-            cum_rews = rollout(cfg, env, model)
+            cum_rews = rollout(
+                env,
+                model,
+                6000,
+            )
             print(f"Step {step}, Cumulative rewards: {cum_rews}")
             model.train()
 
@@ -232,7 +236,7 @@ def main():
     perturbations = np.linspace(0.0, 100.0, 5)
     for perturbations in perturbations:
         cumulative_rewards = rollout(
-            env, model, perturbations, options={"bshin_joint_stiffness": perturbations}
+            env, model, 6000, options={"bshin_joint_stiffness": perturbations}
         )
         print(
             f"Perturbation: {perturbations:.2f} Return: {np.mean(cumulative_rewards):.2f}"
